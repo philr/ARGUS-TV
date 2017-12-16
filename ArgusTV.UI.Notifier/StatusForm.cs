@@ -24,6 +24,7 @@ using System.ComponentModel;
 using System.Drawing;
 using System.IO;
 using System.Net;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -33,6 +34,7 @@ using ArgusTV.DataContracts;
 using ArgusTV.ServiceProxy;
 using ArgusTV.UI.Process;
 using ArgusTV.Common.Logging;
+using System.Reflection;
 
 namespace ArgusTV.UI.Notifier
 {
@@ -53,9 +55,16 @@ namespace ArgusTV.UI.Notifier
         private StatusToolTipForm _toolTipForm;
         private bool _iconContextMenuStripIsOpen;
 
+        private readonly FieldInfo _notifyIconIdField;
+        private readonly FieldInfo _notifyIconWindowField;
+
         public StatusForm()
         {
             InitializeComponent();
+
+            var notifyIconType = _notifyIcon.GetType();
+            _notifyIconIdField = GetNotifyIconField("id");
+            _notifyIconWindowField = GetNotifyIconField("window");
             _notifyIcon.Text = String.Empty;
             Config.Load();
             _notifyIcon.MouseMove += new MouseEventHandler(_notifyIcon_MouseMove);
@@ -64,6 +73,18 @@ namespace ArgusTV.UI.Notifier
             _eventsClientId = String.Format("{0}-{1}-99b8cd44d1ab459cb16f199a48086588", // Unique for the Notifier!
                 Dns.GetHostName(), System.Environment.GetEnvironmentVariable("SESSIONNAME"));
             StartEventListenerTask();
+        }
+
+        private FieldInfo GetNotifyIconField(string name)
+        {
+            var result = _notifyIcon.GetType().GetField(name, BindingFlags.NonPublic | BindingFlags.Instance);
+
+            if (result == null)
+            {
+                throw new InvalidOperationException($"Could not find notify icon {name} field");
+            }
+
+            return result;
         }
 
         private void SettingsForm_Load(object sender, EventArgs e)
@@ -133,6 +154,64 @@ namespace ArgusTV.UI.Notifier
 
         #region Tooltip / TrayIcon / Balloon
 
+        [StructLayout(LayoutKind.Sequential)]
+        private struct RECT
+        {
+            public int left;
+            public int top;
+            public int right;
+            public int bottom;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct NOTIFYICONIDENTIFIER
+        {
+            public uint cbSize;
+            public IntPtr hWnd;
+            public uint uID;
+            public Guid guidItem;
+        }
+
+        private NOTIFYICONIDENTIFIER GetNotifyIconIdentifier()
+        {
+            // Ugly hacks here
+            var result = new NOTIFYICONIDENTIFIER();
+            result.uID = (uint)(int)_notifyIconIdField.GetValue(_notifyIcon);
+            var window = (NativeWindow)_notifyIconWindowField.GetValue(_notifyIcon);
+            result.hWnd = window.Handle;
+            result.cbSize = (uint)Marshal.SizeOf(result);
+            return result;
+        }
+
+        [DllImport("Shell32", SetLastError = true)]
+        private static extern int Shell_NotifyIconGetRect([In] ref NOTIFYICONIDENTIFIER identifier, [Out] out RECT iconLocation);
+
+        private RECT GetNotifyIconRect()
+        {
+            var rect = new RECT();
+            var notifyIconId = GetNotifyIconIdentifier();
+
+            int result = Shell_NotifyIconGetRect(ref notifyIconId, out rect);
+
+            if (result != 0)
+            {
+                // Error - could be just that the icon is not currently visible.
+                // Return a negative sized RECT, so that all points will be outside.
+                rect.top = 0;
+                rect.bottom = -1;
+                rect.left = 0;
+                rect.right = -1;
+            }
+
+            return rect;
+        }
+
+        private bool IsPointInNotifyIconRect(Point point)
+        {
+            var rect = GetNotifyIconRect();
+            return point.X >= rect.left && point.X <= rect.right && point.Y >= rect.top && point.Y <= rect.bottom;
+        }
+
         private void _notifyIcon_MouseMove(object sender, MouseEventArgs e)
         {
             Point position = Cursor.Position;
@@ -141,13 +220,14 @@ namespace ArgusTV.UI.Notifier
             {
                 if (_toolTipTimer.Enabled)
                 {
-                    if (Math.Abs(position.X - _toolTipMousePosition.X) > 1
+                    if (!IsPointInNotifyIconRect(position)
+                        || Math.Abs(position.X - _toolTipMousePosition.X) > 1
                         || Math.Abs(position.Y - _toolTipMousePosition.Y) > 1)
                     {
                         _toolTipTimer.Stop();
                     }
                 }
-                else
+                else if (IsPointInNotifyIconRect(position))
                 {
                     _toolTipMousePosition = position;
                     _toolTipTimer.Interval = 200;
@@ -164,7 +244,8 @@ namespace ArgusTV.UI.Notifier
                 if (!_iconContextMenuStripIsOpen)
                 {
                     Point position = Cursor.Position;
-                    if (Math.Abs(position.X - _toolTipMousePosition.X) < 6
+                    if (IsPointInNotifyIconRect(position)
+                        && Math.Abs(position.X - _toolTipMousePosition.X) < 6
                         && Math.Abs(position.Y - _toolTipMousePosition.Y) < 6)
                     {
                         this.Invoke(new EventHandler(this.EnsureToolTipShown), this, EventArgs.Empty);
